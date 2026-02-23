@@ -10,8 +10,7 @@ from mediapipe import Image, ImageFormat
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core import base_options
 from mediapipe.tasks.python.vision import pose_landmarker
-
-
+#made by William Baranano :D
 MODEL_URL = (
 	"https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
 	"pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
@@ -33,6 +32,52 @@ WB_TORSO_ANGULAR_THRESHOLD_DEG_S = 15.0
 WB_TORSO_TRANSLATION_THRESHOLD = 0.03
 WINDOW_SECONDS = 60.0
 EMA_ALPHA = 0.25
+MAX_POSES = 4
+MAX_TRACK_DISTANCE = 0.12
+TRACK_TTL_S = 1.0
+
+
+class PersonState:
+	def __init__(self, person_id: int, timestamp_s: float) -> None:
+		self.person_id = person_id
+		self.prev_time = timestamp_s
+		self.prev_head_angles = None
+		self.prev_torso_angles = None
+		self.prev_mid_hip = None
+		self.current_event_start = None
+		self.current_event_max_trunk_ang = 0.0
+		self.current_event_max_trunk_trans = 0.0
+		self.events = deque()
+		self.total_events = 0
+		self.head_ang_vel_ema = 0.0
+		self.torso_ang_vel_ema = 0.0
+		self.last_log_time = 0.0
+		self.last_console_time = 0.0
+		self.last_seen = timestamp_s
+		self.last_pos = None
+
+
+def _match_tracks(states: dict[int, PersonState], detections, timestamp_s: float):
+	assigned = {}
+	used_tracks = set()
+
+	for det_index, det_pos in detections:
+		best_id = None
+		best_dist = None
+		for person_id, state in states.items():
+			if person_id in used_tracks or state.last_pos is None:
+				continue
+			dx = det_pos[0] - state.last_pos[0]
+			dy = det_pos[1] - state.last_pos[1]
+			dist = math.sqrt(dx * dx + dy * dy)
+			if best_dist is None or dist < best_dist:
+				best_dist = dist
+				best_id = person_id
+		if best_id is not None and best_dist is not None and best_dist <= MAX_TRACK_DISTANCE:
+			assigned[det_index] = best_id
+			used_tracks.add(best_id)
+
+	return assigned
 
 
 def ensure_model(model_path: str) -> None:
@@ -150,6 +195,7 @@ def main() -> None:
 	options = vision.PoseLandmarkerOptions(
 		base_options=base_options.BaseOptions(model_asset_path=model_path),
 		running_mode=vision.RunningMode.VIDEO,
+		num_poses=MAX_POSES,
 		min_pose_detection_confidence=0.5,
 		min_pose_presence_confidence=0.5,
 		min_tracking_confidence=0.5,
@@ -162,19 +208,8 @@ def main() -> None:
 	frame_dt = 1.0 / cap_fps if cap_fps and cap_fps > 0 else 1.0 / 30.0
 
 	connections = pose_landmarker.PoseLandmarksConnections.POSE_LANDMARKS
-	prev_time = None
-	prev_head_angles = None
-	prev_torso_angles = None
-	prev_mid_hip = None
-	current_event_start = None
-	current_event_max_trunk_ang = 0.0
-	current_event_max_trunk_trans = 0.0
-	events = deque()
-	total_events = 0
-	head_ang_vel_ema = 0.0
-	torso_ang_vel_ema = 0.0
-	last_log_time = 0.0
-	last_console_time = 0.0
+	next_person_id = 1
+	states: dict[int, PersonState] = {}
 	log_interval_s = 1.0
 
 	log_file = open(log_path, "a", encoding="utf-8")
@@ -192,115 +227,145 @@ def main() -> None:
 				if last_timestamp_s is not None and timestamp_s <= last_timestamp_s:
 					timestamp_s = last_timestamp_s + frame_dt
 				last_timestamp_s = timestamp_s
-				dt = 0.0 if prev_time is None else timestamp_s - prev_time
-				prev_time = timestamp_s
-
 				rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 				mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
 				timestamp_ms = int(timestamp_s * 1000)
 				result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
 				if result.pose_landmarks:
-					for landmarks in result.pose_landmarks:
+					detections = []
+					for idx, landmarks in enumerate(result.pose_landmarks):
+						nose = landmarks[NOSE]
+						detections.append((idx, (nose.x, nose.y)))
+
+					assigned = _match_tracks(states, detections, timestamp_s)
+					for det_index, det_pos in detections:
+						if det_index in assigned:
+							person_id = assigned[det_index]
+							state = states[person_id]
+						else:
+							person_id = next_person_id
+							next_person_id += 1
+							state = PersonState(person_id, timestamp_s)
+							states[person_id] = state
+
+						landmarks = result.pose_landmarks[det_index]
 						draw_pose(frame, landmarks, connections)
 
-					landmarks = result.pose_landmarks[0]
-					head_angles = _angles_from_landmarks(landmarks)
-					torso_angles, mid_hip = _torso_angles_and_center(landmarks)
-					head_ang_vel = _angular_speed(prev_head_angles, head_angles, dt)
-					torso_ang_vel = _angular_speed(prev_torso_angles, torso_angles, dt)
-					head_ang_vel_ema = (
-						EMA_ALPHA * head_ang_vel + (1.0 - EMA_ALPHA) * head_ang_vel_ema
-					)
-					torso_ang_vel_ema = (
-						EMA_ALPHA * torso_ang_vel + (1.0 - EMA_ALPHA) * torso_ang_vel_ema
-					)
-					if prev_mid_hip is None or dt <= 0:
-						torso_trans_speed = 0.0
-					else:
-						dx = mid_hip[0] - prev_mid_hip[0]
-						dy = mid_hip[1] - prev_mid_hip[1]
-						torso_trans_speed = math.sqrt(dx * dx + dy * dy) / dt
+						state.last_seen = timestamp_s
+						state.last_pos = det_pos
 
-					prev_head_angles = head_angles
-					prev_torso_angles = torso_angles
-					prev_mid_hip = mid_hip
+						dt = 0.0 if state.prev_time is None else timestamp_s - state.prev_time
+						state.prev_time = timestamp_s
 
-					if head_ang_vel_ema > HAV_EVENT_THRESHOLD_DEG_S:
-						if current_event_start is None:
-							current_event_start = timestamp_s
-							current_event_max_trunk_ang = 0.0
-							current_event_max_trunk_trans = 0.0
-						current_event_max_trunk_ang = max(
-							current_event_max_trunk_ang, torso_ang_vel_ema
+						head_angles = _angles_from_landmarks(landmarks)
+						torso_angles, mid_hip = _torso_angles_and_center(landmarks)
+						head_ang_vel = _angular_speed(state.prev_head_angles, head_angles, dt)
+						torso_ang_vel = _angular_speed(state.prev_torso_angles, torso_angles, dt)
+						state.head_ang_vel_ema = (
+							EMA_ALPHA * head_ang_vel
+							+ (1.0 - EMA_ALPHA) * state.head_ang_vel_ema
 						)
-						current_event_max_trunk_trans = max(
-							current_event_max_trunk_trans, torso_trans_speed
+						state.torso_ang_vel_ema = (
+							EMA_ALPHA * torso_ang_vel
+							+ (1.0 - EMA_ALPHA) * state.torso_ang_vel_ema
 						)
-					else:
-						if current_event_start is not None:
-							duration = timestamp_s - current_event_start
-							if duration >= HAV_EVENT_MIN_DURATION_S:
-								is_wb = (
-									current_event_max_trunk_ang
-									>= WB_TORSO_ANGULAR_THRESHOLD_DEG_S
-									or current_event_max_trunk_trans
-									>= WB_TORSO_TRANSLATION_THRESHOLD
-								)
-								events.append((timestamp_s, is_wb))
-								total_events += 1
-								timestamp = time.strftime(
-									"%Y-%m-%d %H:%M:%S", time.localtime(now)
-								)
-								log_file.write(
-									f"{timestamp}, EVENT=1, TOTAL={total_events}\n"
-								)
-							current_event_start = None
-							current_event_max_trunk_ang = 0.0
-							current_event_max_trunk_trans = 0.0
+						if state.prev_mid_hip is None or dt <= 0:
+							torso_trans_speed = 0.0
+						else:
+							dx = mid_hip[0] - state.prev_mid_hip[0]
+							dy = mid_hip[1] - state.prev_mid_hip[1]
+							torso_trans_speed = math.sqrt(dx * dx + dy * dy) / dt
 
-					while events and timestamp_s - events[0][0] > WINDOW_SECONDS:
-						events.popleft()
+						state.prev_head_angles = head_angles
+						state.prev_torso_angles = torso_angles
+						state.prev_mid_hip = mid_hip
 
-					window_events = list(events)
-					hmf = len(window_events) * (60.0 / WINDOW_SECONDS)
-					wb_count = sum(1 for _, is_wb in window_events if is_wb)
-					no_count = len(window_events) - wb_count
-					wb_no_ratio = wb_count / max(1, no_count)
+						if state.head_ang_vel_ema > HAV_EVENT_THRESHOLD_DEG_S:
+							if state.current_event_start is None:
+								state.current_event_start = timestamp_s
+								state.current_event_max_trunk_ang = 0.0
+								state.current_event_max_trunk_trans = 0.0
+							state.current_event_max_trunk_ang = max(
+								state.current_event_max_trunk_ang, state.torso_ang_vel_ema
+							)
+							state.current_event_max_trunk_trans = max(
+								state.current_event_max_trunk_trans, torso_trans_speed
+							)
+						else:
+							if state.current_event_start is not None:
+								duration = timestamp_s - state.current_event_start
+								if duration >= HAV_EVENT_MIN_DURATION_S:
+									is_wb = (
+										state.current_event_max_trunk_ang
+										>= WB_TORSO_ANGULAR_THRESHOLD_DEG_S
+										or state.current_event_max_trunk_trans
+										>= WB_TORSO_TRANSLATION_THRESHOLD
+									)
+									state.events.append((timestamp_s, is_wb))
+									state.total_events += 1
+									timestamp = time.strftime(
+										"%Y-%m-%d %H:%M:%S", time.localtime(now)
+									)
+									log_file.write(
+										f"{timestamp}, ID={person_id}, EVENT=1, TOTAL={state.total_events}\n"
+									)
+								state.current_event_start = None
+								state.current_event_max_trunk_ang = 0.0
+								state.current_event_max_trunk_trans = 0.0
 
-					overlay_lines = [
-						f"HAV: {head_ang_vel_ema:.1f} deg/s (slow<{HAV_SLOW_THRESHOLD_DEG_S:.0f})",
-						f"HMF: {hmf:.1f} events/min",
-						f"WB/NO ratio (60s): {wb_no_ratio:.2f}",
-					]
-					y = 24
-					for line in overlay_lines:
-						cv2.putText(
-							frame,
-							line,
-							(10, y),
-							cv2.FONT_HERSHEY_SIMPLEX,
-							0.6,
-							(255, 255, 255),
-							2,
-						)
-						y += 22
+						while state.events and timestamp_s - state.events[0][0] > WINDOW_SECONDS:
+							state.events.popleft()
 
-					if timestamp_s - last_log_time >= log_interval_s:
-						timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
-						log_file.write(
-							f"{timestamp}, HAV={head_ang_vel_ema:.2f}, HMF={hmf:.2f}, "
-							f"WB_NO={wb_no_ratio:.3f}, TOTAL={total_events}\n"
-						)
-						log_file.flush()
-						last_log_time = timestamp_s
+						window_events = list(state.events)
+						hmf = len(window_events) * (60.0 / WINDOW_SECONDS)
+						wb_count = sum(1 for _, is_wb in window_events if is_wb)
+						no_count = len(window_events) - wb_count
+						wb_no_ratio = wb_count / max(1, no_count)
 
-					if timestamp_s - last_console_time >= log_interval_s:
-						print(
-							f"HAV={head_ang_vel_ema:.2f} deg/s | "
-							f"HMF={hmf:.2f} events/min | WB/NO={wb_no_ratio:.2f}"
-						)
-						last_console_time = timestamp_s
+						overlay_lines = [
+							f"ID {person_id} | HAV {state.head_ang_vel_ema:.1f} deg/s",
+							f"HMF {hmf:.1f}/min | WB/NO {wb_no_ratio:.2f}",
+							f"Total: {state.total_events}",
+						]
+						center_x = int(det_pos[0] * frame.shape[1])
+						center_y = int(det_pos[1] * frame.shape[0])
+						y = max(20, center_y - 40)
+						for line in overlay_lines:
+							cv2.putText(
+								frame,
+								line,
+								(center_x - 70, y),
+								cv2.FONT_HERSHEY_SIMPLEX,
+								0.5,
+								(255, 255, 255),
+								2,
+							)
+							y += 18
+
+						if timestamp_s - state.last_log_time >= log_interval_s:
+							timestamp = time.strftime(
+								"%Y-%m-%d %H:%M:%S", time.localtime(now)
+							)
+							log_file.write(
+								f"{timestamp}, ID={person_id}, "
+								f"HAV={state.head_ang_vel_ema:.2f}, HMF={hmf:.2f}, "
+								f"WB_NO={wb_no_ratio:.3f}, TOTAL={state.total_events}\n"
+							)
+							log_file.flush()
+							state.last_log_time = timestamp_s
+
+						if timestamp_s - state.last_console_time >= log_interval_s:
+							print(
+								f"ID {person_id} | HAV={state.head_ang_vel_ema:.2f} deg/s | "
+								f"HMF={hmf:.2f} events/min | WB/NO={wb_no_ratio:.2f} | "
+								f"TOTAL={state.total_events}"
+							)
+							state.last_console_time = timestamp_s
+
+				for person_id in list(states.keys()):
+					if timestamp_s - states[person_id].last_seen > TRACK_TTL_S:
+						del states[person_id]
 
 				cv2.imshow("Pose Tracker", frame)
 				if cv2.waitKey(1) & 0xFF == 27:
